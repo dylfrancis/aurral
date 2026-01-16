@@ -12,7 +12,13 @@ RUN npm run build
 
 FROM nginx:alpine
 
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Set default environment variables for backward compatibility
+ENV BACKEND_HOST=backend
+ENV BACKEND_PORT=3001
+
+# Copy nginx config as a template for envsubst
+# The official nginx image will process this into /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 

@@ -129,6 +129,8 @@ Aurral features a discovery system that helps you find new music based on what y
 
 ## Configuration
 
+### Backend Variables
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LIDARR_URL` | Full URL to your Lidarr instance | `http://localhost:8686` |
@@ -136,6 +138,19 @@ Aurral features a discovery system that helps you find new music based on what y
 | `CONTACT_EMAIL` | Required for MusicBrainz API User-Agent | `REQUIRED` |
 | `PORT` | Backend API port | `3001` |
 | `LASTFM_API_KEY`| (Optional) For enhanced artist images & discovery | `null` |
+| `DEBUG` | Enable debug logging | `false` |
+
+### Frontend Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BACKEND_HOST` | Backend hostname or IP address | `backend` |
+| `BACKEND_PORT` | Backend API port | `3001` |
+
+**Note:** The frontend variables are particularly useful for Kubernetes/GitOps deployments. For example:
+- **Single Pod (sidecar)**: Set `BACKEND_HOST=127.0.0.1` when frontend and backend run in the same Pod
+- **Custom Service Names**: Set `BACKEND_HOST=my-backend-service.namespace.svc.cluster.local` for custom Kubernetes service names
+- **Docker Compose**: Defaults work out of the box, no configuration needed
 
 ---
 
