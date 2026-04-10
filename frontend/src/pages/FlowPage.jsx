@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { Loader2, Settings } from "lucide-react";
+import { Loader2, Settings, Upload } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import {
   getFlowStatus,
@@ -7,9 +7,15 @@ import {
   createFlow,
   updateFlow,
   deleteFlow,
+  convertFlowToStaticPlaylist,
+  deleteSharedPlaylist,
+  deleteSharedPlaylistTrack,
+  importSharedPlaylist,
+  updateSharedPlaylist,
   setFlowEnabled,
   getFlowTrackStreamUrl,
   updateFlowWorkerSettings,
+  setPlaylistRetryCyclePaused,
 } from "../utils/api";
 import { useToast } from "../contexts/ToastContext";
 import { useWebSocketChannel } from "../hooks/useWebSocket";
@@ -18,8 +24,9 @@ import {
   FlowEmptyState,
   ConfirmDeleteModal,
   ConfirmDisableModal,
-  ConfirmStopAllModal,
   FlowWorkerSettingsModal,
+  FlowImportReviewModal,
+  SharedPlaylistCard,
 } from "./FlowPageComponents";
 
 function formatNextRun(nextRunAt, now = Date.now()) {
@@ -94,7 +101,10 @@ const NEW_FLOW_TEMPLATE = {
   deepDive: false,
   tags: {},
   relatedArtists: {},
+  scheduleTime: "00:00",
 };
+const FLOW_SHARE_FILE_VERSION = 1;
+const FLOW_SHARE_FILE_TYPE = "aurral-static-tracklist";
 
 const getNextFlowName = (flows, baseName = "Discover") => {
   const normalizedBase = String(baseName || "").trim() || "Discover";
@@ -117,6 +127,40 @@ const getNextFlowName = (flows, baseName = "Discover") => {
   return `${normalizedBase} ${Date.now()}`;
 };
 
+const slugifyFilePart = (value, fallback = "flow") => {
+  const slug = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || fallback;
+};
+
+const normalizeNameKey = (value) => String(value || "").trim().toLowerCase();
+
+const reserveUniqueFlowName = (reservedNames, baseName) => {
+  const normalizedBase = String(baseName || "").trim() || "Flow";
+  const baseKey = normalizeNameKey(normalizedBase);
+  if (!reservedNames.has(baseKey)) {
+    reservedNames.add(baseKey);
+    return normalizedBase;
+  }
+  let index = 2;
+  while (index < 10000) {
+    const candidate = `${normalizedBase} ${index}`;
+    const key = normalizeNameKey(candidate);
+    if (!reservedNames.has(key)) {
+      reservedNames.add(key);
+      return candidate;
+    }
+    index += 1;
+  }
+  const fallback = `${normalizedBase} ${Date.now()}`;
+  reservedNames.add(normalizeNameKey(fallback));
+  return fallback;
+};
+
 const parseListInput = (value) =>
   String(value ?? "")
     .split(",")
@@ -134,6 +178,21 @@ const normalizeScheduleDays = (value) => {
     unique.add(normalized);
   }
   return [...unique].sort((a, b) => a - b);
+};
+
+const normalizeScheduleTime = (value) => {
+  const text = String(value ?? "").trim();
+  const match = /^(\d{1,2}):(\d{2})$/.exec(text);
+  if (!match) return "00:00";
+  const hours = Number(match[1]);
+  if (
+    !Number.isInteger(hours) ||
+    hours < 0 ||
+    hours > 23
+  ) {
+    return "00:00";
+  }
+  return `${String(hours).padStart(2, "0")}:00`;
 };
 
 const normalizeMixPercent = (mix) => {
@@ -368,6 +427,7 @@ const flowToForm = (flow) => {
       normalizeScheduleDays(flow?.scheduleDays).length > 0
         ? normalizeScheduleDays(flow?.scheduleDays)
         : [new Date().getDay()],
+    scheduleTime: normalizeScheduleTime(flow?.scheduleTime),
   };
 };
 
@@ -398,6 +458,7 @@ const buildFlowFromForm = (draft) => {
   if (scheduleDays.length === 0) {
     throw new Error("Select at least one day for this flow schedule");
   }
+  const scheduleTime = normalizeScheduleTime(draft?.scheduleTime);
   const focusCounts = buildCountsFromFocusPercent(
     size,
     tagFocusPercent,
@@ -432,6 +493,7 @@ const buildFlowFromForm = (draft) => {
     relatedArtists,
     deepDive: draft?.deepDive === true,
     scheduleDays,
+    scheduleTime,
   };
 };
 
@@ -451,6 +513,7 @@ const normalizeDraftForCompare = (draft) => {
     relatedStrength: draft?.relatedStrength ?? "medium",
     deepDive: draft?.deepDive === true,
     scheduleDays: normalizeScheduleDays(draft?.scheduleDays),
+    scheduleTime: normalizeScheduleTime(draft?.scheduleTime),
   };
 };
 
@@ -460,25 +523,199 @@ const isFlowDirty = (flow, draft) => {
   return JSON.stringify(base) !== JSON.stringify(next);
 };
 
+const normalizeSharedTrackEntry = (track) => {
+  if (!track || typeof track !== "object" || Array.isArray(track)) return null;
+  const artistName = String(
+    track.artistName ??
+      track.artist ??
+      track.artist_name ??
+      track["Artist Name(s)"] ??
+      "",
+  ).trim();
+  const trackName = String(
+    track.trackName ??
+      track.title ??
+      track.name ??
+      track.track ??
+      track["Track Name"] ??
+      "",
+  ).trim();
+  if (!artistName || !trackName) return null;
+  const albumName = String(
+    track.albumName ?? track.album ?? track["Album Name"] ?? "",
+  ).trim();
+  const artistMbid = String(track.artistMbid ?? track.artistId ?? track.mbid ?? "").trim();
+  return {
+    artistName,
+    trackName,
+    albumName: albumName || null,
+    artistMbid: artistMbid || null,
+  };
+};
+
+const buildSharedTracklistPayload = ({ name, sourceName, sourceFlowId, tracks }) => ({
+  type: FLOW_SHARE_FILE_TYPE,
+  version: FLOW_SHARE_FILE_VERSION,
+  exportedAt: new Date().toISOString(),
+  name: String(name || "").trim() || "Shared Playlist",
+  sourceName: String(sourceName || "").trim() || null,
+  sourceFlowId: String(sourceFlowId || "").trim() || null,
+  trackCount: Array.isArray(tracks) ? tracks.length : 0,
+  tracks: (Array.isArray(tracks) ? tracks : []).map((track) => ({
+    artistName: String(track.artistName || "").trim(),
+    trackName: String(track.trackName || "").trim(),
+    albumName: track.albumName ? String(track.albumName).trim() : null,
+    artistMbid: track.artistMbid ? String(track.artistMbid).trim() : null,
+  })),
+});
+
+const downloadFlowShareBundle = (fileName, payload) => {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: "application/json",
+  });
+  const objectUrl = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => {
+    window.URL.revokeObjectURL(objectUrl);
+  }, 0);
+};
+
+const parseFlowImportFile = (content) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw new Error("Import file is not valid JSON");
+  }
+
+  const toPlaylistPayload = (entry, index) => {
+    if (Array.isArray(entry)) {
+      const tracks = entry.map(normalizeSharedTrackEntry).filter(Boolean);
+      if (tracks.length === 0) {
+        throw new Error(`Tracklist ${index + 1}: no valid tracks found`);
+      }
+      return {
+        name: `Imported Playlist ${index + 1}`,
+        sourceName: null,
+        sourceFlowId: null,
+        trackCount: tracks.length,
+        tracks,
+      };
+    }
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`Tracklist ${index + 1}: invalid playlist payload`);
+    }
+    const rawTracks = Array.isArray(entry.tracks)
+      ? entry.tracks
+      : Array.isArray(entry.playlist?.tracks)
+        ? entry.playlist.tracks
+        : null;
+    if (!rawTracks?.length) {
+      throw new Error(`Tracklist ${index + 1}: no tracks found`);
+    }
+    const tracks = rawTracks.map(normalizeSharedTrackEntry).filter(Boolean);
+    if (tracks.length === 0) {
+      throw new Error(`Tracklist ${index + 1}: no valid tracks found`);
+    }
+    return {
+      name:
+        String(entry.name ?? entry.playlist?.name ?? entry.sourceName ?? "").trim() ||
+        `Imported Playlist ${index + 1}`,
+      sourceName:
+        String(entry.sourceName ?? entry.source?.name ?? "").trim() || null,
+      sourceFlowId:
+        String(entry.sourceFlowId ?? entry.source?.id ?? "").trim() || null,
+      trackCount: tracks.length,
+      tracks,
+    };
+  };
+
+  let entries = [];
+  if (Array.isArray(parsed)) {
+    const looksLikeTrackArray = parsed.every(
+      (entry) => entry && typeof entry === "object" && !Array.isArray(entry),
+    );
+    entries = looksLikeTrackArray ? [parsed] : parsed;
+  } else if (
+    parsed &&
+    typeof parsed === "object" &&
+    Array.isArray(parsed.playlists)
+  ) {
+    entries = parsed.playlists;
+  } else if (
+    parsed &&
+    typeof parsed === "object" &&
+    Array.isArray(parsed.tracks)
+  ) {
+    entries = [parsed];
+  } else if (
+    parsed &&
+    typeof parsed === "object" &&
+    parsed.playlist &&
+    typeof parsed.playlist === "object"
+  ) {
+    entries = [parsed.playlist];
+  } else if (parsed && typeof parsed === "object") {
+    entries = [parsed];
+  }
+
+  if (!entries.length) {
+    throw new Error("Import file does not contain any tracklists");
+  }
+
+  const playlists = entries
+    .map((entry, index) => {
+      try {
+        return toPlaylistPayload(entry, index);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  if (!playlists.length) {
+    throw new Error("Import file does not contain any valid tracks");
+  }
+
+  return playlists;
+};
+
 const EMPTY_FLOW_STATS = {
   total: 0,
   done: 0,
   pending: 0,
   downloading: 0,
+  failed: 0,
 };
 
 const DEFAULT_WORKER_SETTINGS = {
   concurrency: 3,
   preferredFormat: "flac",
   preferredFormatStrict: false,
-  seedDownloads: true,
+  retryCycleMinutes: 15,
+};
+const FLOW_WORKER_RETRY_CYCLE_OPTIONS = [15, 30, 60, 360, 720, 1440];
+
+const normalizeRetryCycleMinutes = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_WORKER_SETTINGS.retryCycleMinutes;
+  const normalized = Math.floor(parsed);
+  if (FLOW_WORKER_RETRY_CYCLE_OPTIONS.includes(normalized)) {
+    return normalized;
+  }
+  return DEFAULT_WORKER_SETTINGS.retryCycleMinutes;
 };
 
 const buildFlowStatsFromJobs = (jobs) => {
   const stats = { ...EMPTY_FLOW_STATS };
   if (!Array.isArray(jobs)) return stats;
   for (const job of jobs) {
-    if (!job?.status || job.status === "failed") continue;
+    if (!job?.status) continue;
     stats[job.status] = (stats[job.status] || 0) + 1;
   }
   stats.total = stats.pending + stats.downloading + stats.done;
@@ -489,11 +726,13 @@ const sanitizeFlowStats = (stats) => {
   const pending = Number(stats?.pending || 0);
   const downloading = Number(stats?.downloading || 0);
   const done = Number(stats?.done || 0);
+  const failed = Number(stats?.failed || 0);
   return {
     total: pending + downloading + done,
     pending,
     downloading,
     done,
+    failed,
   };
 };
 
@@ -503,7 +742,6 @@ function FlowPage() {
   const [loading, setLoading] = useState(true);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmDisable, setConfirmDisable] = useState(null);
-  const [confirmStopAll, setConfirmStopAll] = useState(false);
   const [isWorkerSettingsOpen, setIsWorkerSettingsOpen] = useState(false);
   const [workerSettingsDraft, setWorkerSettingsDraft] = useState(
     DEFAULT_WORKER_SETTINGS,
@@ -515,19 +753,27 @@ function FlowPage() {
   const [optimisticEnabled, setOptimisticEnabled] = useState({});
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState(null);
+  const [convertingId, setConvertingId] = useState(null);
   const [togglingId, setTogglingId] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [simpleDrafts, setSimpleDrafts] = useState({});
   const [simpleErrors, setSimpleErrors] = useState({});
+  const [sharedPlaylistDrafts, setSharedPlaylistDrafts] = useState({});
+  const [sharedPlaylistErrors, setSharedPlaylistErrors] = useState({});
   const [applyingFlowId, setApplyingFlowId] = useState(null);
+  const [applyingSharedPlaylistId, setApplyingSharedPlaylistId] = useState(null);
+  const [deletingSharedTrackId, setDeletingSharedTrackId] = useState(null);
+  const [retryActionPlaylistId, setRetryActionPlaylistId] = useState(null);
   const [flowStatsById, setFlowStatsById] = useState({});
   const [tracksExpandedId, setTracksExpandedId] = useState(null);
   const [tracksLoadingByFlowId, setTracksLoadingByFlowId] = useState({});
   const [tracksErrorByFlowId, setTracksErrorByFlowId] = useState({});
   const [tracksByFlowId, setTracksByFlowId] = useState({});
-  const [bulkActionRunning, setBulkActionRunning] = useState(false);
   const [countdownNow, setCountdownNow] = useState(() => Date.now());
+  const [importReview, setImportReview] = useState(null);
+  const [importing, setImporting] = useState(false);
   const lastFlowWsMessageAtRef = useRef(0);
+  const importInputRef = useRef(null);
   const { showSuccess, showError } = useToast();
 
   const fetchStatus = useCallback(async () => {
@@ -584,16 +830,28 @@ function FlowPage() {
   }, []);
 
   const activeFlowIdsKey = useMemo(() => {
-    if (!status?.worker?.running || !status?.flows?.length) return "";
-    const activeIds = status.flows
+    if (!status?.worker?.running) return "";
+    const activeItems = [
+      ...(Array.isArray(status?.flows) ? status.flows : []),
+      ...(Array.isArray(status?.sharedPlaylists) ? status.sharedPlaylists : []),
+    ];
+    if (!activeItems.length) return "";
+    const activeIds = activeItems
       .filter((flow) => {
-        const stats = status.flowStats?.[flow.id];
+        const stats =
+          status.flowStats?.[flow.id] || status.sharedPlaylistStats?.[flow.id];
         return (stats?.pending || 0) > 0 || (stats?.downloading || 0) > 0;
       })
       .map((flow) => flow.id)
       .sort();
     return activeIds.join("|");
-  }, [status?.worker?.running, status?.flows, status?.flowStats]);
+  }, [
+    status?.worker?.running,
+    status?.flows,
+    status?.sharedPlaylists,
+    status?.flowStats,
+    status?.sharedPlaylistStats,
+  ]);
 
   useEffect(() => {
     if (!activeFlowIdsKey) return;
@@ -631,21 +889,26 @@ function FlowPage() {
   }, [activeFlowIdsKey]);
 
   useEffect(() => {
-    if (!status?.flows?.length) {
+    const playlistIds = new Set([
+      ...(Array.isArray(status?.flows) ? status.flows.map((flow) => flow.id) : []),
+      ...(Array.isArray(status?.sharedPlaylists)
+        ? status.sharedPlaylists.map((playlist) => playlist.id)
+        : []),
+    ]);
+    if (playlistIds.size === 0) {
       setFlowStatsById({});
       return;
     }
-    const flowIds = new Set(status.flows.map((flow) => flow.id));
     setFlowStatsById((prev) => {
       const next = {};
       for (const [flowId, stats] of Object.entries(prev)) {
-        if (flowIds.has(flowId)) {
+        if (playlistIds.has(flowId)) {
           next[flowId] = stats;
         }
       }
       return next;
     });
-  }, [status?.flows]);
+  }, [status?.flows, status?.sharedPlaylists]);
 
   useEffect(() => {
     if (!status?.flows?.length) return;
@@ -669,9 +932,23 @@ function FlowPage() {
     });
   }, [status?.flows]);
 
+  useEffect(() => {
+    if (!status?.sharedPlaylists?.length) return;
+    setSharedPlaylistDrafts((prev) => {
+      const next = { ...prev };
+      for (const playlist of status.sharedPlaylists) {
+        if (typeof next[playlist.id] !== "string") {
+          next[playlist.id] = playlist.name || "";
+        }
+      }
+      return next;
+    });
+  }, [status?.sharedPlaylists]);
+
   const getPlaylistStats = (flowId) => {
     return sanitizeFlowStats(
       status?.flowStats?.[flowId] ||
+      status?.sharedPlaylistStats?.[flowId] ||
       flowStatsById[flowId] ||
       EMPTY_FLOW_STATS,
     );
@@ -763,6 +1040,7 @@ function FlowPage() {
     setConfirmDelete({
       flowId: flow.id,
       title: flow.name,
+      kind: "flow",
     });
   };
 
@@ -770,12 +1048,21 @@ function FlowPage() {
     if (!confirmDelete) return;
     setDeletingId(confirmDelete.flowId);
     try {
-      await deleteFlow(confirmDelete.flowId);
-      showSuccess("Flow deleted");
+      if (confirmDelete.kind === "shared") {
+        await deleteSharedPlaylist(confirmDelete.flowId);
+        showSuccess("Shared playlist deleted");
+      } else {
+        await deleteFlow(confirmDelete.flowId);
+        showSuccess("Flow deleted");
+      }
       await fetchStatus();
     } catch (err) {
       showError(
-        err.response?.data?.message || err.message || "Failed to delete flow"
+        err.response?.data?.message ||
+          err.message ||
+          (confirmDelete.kind === "shared"
+            ? "Failed to delete shared playlist"
+            : "Failed to delete flow")
       );
     } finally {
       setDeletingId(null);
@@ -813,6 +1100,7 @@ function FlowPage() {
   };
 
   const flowList = status?.flows || [];
+  const sharedPlaylists = status?.sharedPlaylists || [];
   const effectiveFlowList = flowList.map((flow) => {
     const optimisticValue = optimisticEnabled[flow.id];
     if (typeof optimisticValue !== "boolean") return flow;
@@ -821,11 +1109,6 @@ function FlowPage() {
       enabled: optimisticValue,
     };
   });
-  const disabledFlowCount = effectiveFlowList.filter(
-    (flow) => flow.enabled !== true,
-  ).length;
-  const enabledFlowCount = effectiveFlowList.length - disabledFlowCount;
-
   const handleConfirmDisable = async () => {
     if (!confirmDisable) return;
     const flow = flowList.find((entry) => entry.id === confirmDisable.flowId);
@@ -834,81 +1117,6 @@ function FlowPage() {
       await handleToggleEnabled(flow, false);
     }
     setConfirmDisable(null);
-  };
-
-  const handleSetAllEnabled = async (targetEnabled) => {
-    if (bulkActionRunning) return;
-    const targetFlows = flowList.filter((flow) => {
-      const optimisticValue = optimisticEnabled[flow.id];
-      const isEnabled =
-        typeof optimisticValue === "boolean"
-          ? optimisticValue
-          : flow.enabled === true;
-      return targetEnabled ? !isEnabled : isEnabled;
-    });
-    if (targetFlows.length === 0) return;
-
-    setBulkActionRunning(true);
-    setOptimisticEnabled((prev) => {
-      const next = { ...prev };
-      for (const flow of targetFlows) {
-        next[flow.id] = targetEnabled;
-      }
-      return next;
-    });
-
-    let successCount = 0;
-    const failed = [];
-    for (const flow of targetFlows) {
-      try {
-        await setFlowEnabled(flow.id, targetEnabled);
-        successCount += 1;
-      } catch (err) {
-        failed.push({
-          name: flow.name || "Flow",
-          message:
-            err.response?.data?.message ||
-            err.message ||
-            `Failed to ${targetEnabled ? "start" : "stop"} flow`,
-        });
-      }
-    }
-
-    if (successCount > 0) {
-      showSuccess(
-        successCount === targetFlows.length
-          ? `${targetEnabled ? "Started" : "Stopped"} ${successCount} flows`
-          : `${targetEnabled ? "Started" : "Stopped"} ${successCount} flows with ${failed.length} failures`,
-      );
-    }
-    if (failed.length > 0) {
-      const first = failed[0];
-      showError(
-        failed.length === 1
-          ? `${first.name}: ${first.message}`
-          : `Failed to ${targetEnabled ? "start" : "stop"} ${failed.length} flows. First issue: ${first.name} - ${first.message}`,
-      );
-    }
-
-    await fetchStatus();
-    setOptimisticEnabled((prev) => {
-      const next = { ...prev };
-      for (const flow of targetFlows) {
-        delete next[flow.id];
-      }
-      return next;
-    });
-    setBulkActionRunning(false);
-  };
-
-  const handleStopAllRequest = () => {
-    if (bulkActionRunning || enabledFlowCount === 0) return;
-    setConfirmStopAll(true);
-  };
-
-  const handleConfirmStopAll = async () => {
-    setConfirmStopAll(false);
-    await handleSetAllEnabled(false);
   };
 
   const getCurrentWorkerSettings = () => {
@@ -923,12 +1131,12 @@ function FlowPage() {
         ? "mp3"
         : "flac";
     const preferredFormatStrict = raw.preferredFormatStrict === true;
-    const seedDownloads = raw.seedDownloads !== false;
+    const retryCycleMinutes = normalizeRetryCycleMinutes(raw.retryCycleMinutes);
     return {
       concurrency,
       preferredFormat,
       preferredFormatStrict,
-      seedDownloads,
+      retryCycleMinutes,
     };
   };
 
@@ -937,6 +1145,270 @@ function FlowPage() {
     setWorkerSettingsBaseline(current);
     setWorkerSettingsDraft(current);
     setIsWorkerSettingsOpen(true);
+  };
+
+  const exportTracklist = async ({
+    playlistId,
+    playlistName,
+    sourceName = null,
+    sourceFlowId = null,
+  }) => {
+    if (!playlistId) return;
+    const jobs = await getFlowJobs(playlistId, 500);
+    const tracks = (Array.isArray(jobs) ? jobs : [])
+      .filter((job) => job?.status !== "failed")
+      .map((job) => ({
+        artistName: job.artistName,
+        trackName: job.trackName,
+        albumName: job.albumName || null,
+        artistMbid: job.artistMbid || null,
+      }))
+      .filter((track) => track.artistName && track.trackName);
+    if (tracks.length === 0) {
+      throw new Error("No generated tracks available to export yet");
+    }
+    downloadFlowShareBundle(
+      `aurral-tracklist-${slugifyFilePart(playlistName)}.json`,
+      buildSharedTracklistPayload({
+        name: playlistName,
+        sourceName: sourceName || playlistName,
+        sourceFlowId,
+        tracks,
+      }),
+    );
+  };
+
+  const handleExportFlow = async (flow) => {
+    if (!flow) return;
+    try {
+      await exportTracklist({
+        playlistId: flow.id,
+        playlistName: flow.name,
+        sourceName: flow.name,
+        sourceFlowId: flow.id,
+      });
+      showSuccess(`Exported ${flow.name} tracklist`);
+    } catch (error) {
+      showError(error?.message || "Failed to export tracklist");
+    }
+  };
+
+  const handleOpenImportPicker = () => {
+    if (importInputRef.current) {
+      importInputRef.current.value = "";
+      importInputRef.current.click();
+    }
+  };
+
+  const handleImportFileChange = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const content = await file.text();
+      const flows = parseFlowImportFile(content).map((flow) => ({
+        ...flow,
+        importName: flow?.name || "",
+      }));
+      setImportReview({
+        fileName: file.name,
+        flows,
+      });
+    } catch (error) {
+      showError(error?.message || "Failed to read tracklist file");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
+  const handleConfirmImport = async () => {
+    if (!importReview || importing) return;
+    setImporting(true);
+    const reservedNames = new Set(
+      (status?.sharedPlaylists || [])
+        .map((playlist) => normalizeNameKey(playlist?.name))
+        .filter(Boolean),
+    );
+    let importedCount = 0;
+    let renamedCount = 0;
+    const failed = [];
+
+    for (const payload of importReview.flows) {
+      const desiredName = String(payload?.importName ?? payload?.name ?? "").trim();
+      const baseName = desiredName || String(payload?.name || "").trim();
+      const finalName = reserveUniqueFlowName(reservedNames, baseName);
+      if (finalName !== baseName) {
+        renamedCount += 1;
+      }
+      try {
+        await importSharedPlaylist({
+          name: finalName,
+          sourceName: payload?.sourceName || null,
+          sourceFlowId: payload?.sourceFlowId || null,
+          tracks: payload?.tracks || [],
+        });
+        importedCount += 1;
+      } catch (error) {
+        failed.push({
+          name: finalName,
+          message:
+            error?.response?.data?.message ||
+            error?.response?.data?.error ||
+            error?.message ||
+            "Failed to import tracklist",
+        });
+      }
+    }
+
+    try {
+      await fetchStatus();
+    } finally {
+      setImporting(false);
+    }
+
+    if (importedCount > 0) {
+      showSuccess(
+        `${importedCount} ${importedCount === 1 ? "tracklist" : "tracklists"} imported${renamedCount > 0 ? ` • ${renamedCount} renamed` : ""}`,
+      );
+      setImportReview(null);
+    }
+    if (failed.length > 0) {
+      const first = failed[0];
+      showError(
+        failed.length === 1
+          ? `${first.name}: ${first.message}`
+          : `${failed.length} imports failed. First issue: ${first.name} - ${first.message}`,
+      );
+    }
+  };
+
+  const handleDeleteSharedPlaylist = (playlist) => {
+    if (!playlist) return;
+    setConfirmDelete({
+      flowId: playlist.id,
+      title: playlist.name,
+      kind: "shared",
+    });
+  };
+
+  const handleCancelSharedPlaylistEdit = (playlist) => {
+    setSharedPlaylistDrafts((prev) => ({
+      ...prev,
+      [playlist.id]: playlist.name || "",
+    }));
+    setSharedPlaylistErrors((prev) => {
+      const next = { ...prev };
+      delete next[playlist.id];
+      return next;
+    });
+    setEditingId((prev) => (prev === playlist.id ? null : prev));
+  };
+
+  const handleApplySharedPlaylist = async (playlist) => {
+    if (!playlist) return;
+    setApplyingSharedPlaylistId(playlist.id);
+    setSharedPlaylistErrors((prev) => {
+      const next = { ...prev };
+      delete next[playlist.id];
+      return next;
+    });
+    try {
+      const name = String(sharedPlaylistDrafts[playlist.id] ?? playlist.name ?? "").trim();
+      const response = await updateSharedPlaylist(playlist.id, { name });
+      const updatedPlaylist = response?.playlist || { ...playlist, name };
+      setSharedPlaylistDrafts((prev) => ({
+        ...prev,
+        [playlist.id]: updatedPlaylist.name || "",
+      }));
+      setEditingId((prev) => (prev === playlist.id ? null : prev));
+      showSuccess("Static playlist updated");
+      await fetchStatus();
+    } catch (err) {
+      const message =
+        err.response?.data?.message ||
+        err.message ||
+        "Failed to update static playlist";
+      setSharedPlaylistErrors((prev) => ({
+        ...prev,
+        [playlist.id]: message,
+      }));
+      showError(message);
+    } finally {
+      setApplyingSharedPlaylistId(null);
+    }
+  };
+
+  const handleDeleteSharedPlaylistTrack = async (playlist, track) => {
+    if (!playlist?.id || !track?.id || deletingSharedTrackId) return;
+    setDeletingSharedTrackId(track.id);
+    try {
+      await deleteSharedPlaylistTrack(playlist.id, track.id);
+      setTracksByFlowId((prev) => ({
+        ...prev,
+        [playlist.id]: (prev[playlist.id] || []).filter((entry) => entry.id !== track.id),
+      }));
+      await fetchStatus();
+      await fetchFlowTracks(playlist.id, { showSpinner: false });
+      showSuccess(`Removed ${track.trackName} from ${playlist.name}`);
+    } catch (err) {
+      showError(
+        err.response?.data?.message ||
+          err.response?.data?.error ||
+          err.message ||
+          "Failed to remove track from static playlist",
+      );
+    } finally {
+      setDeletingSharedTrackId(null);
+    }
+  };
+
+  const handleSetRetryCyclePaused = async (playlistId, paused) => {
+    if (!playlistId || retryActionPlaylistId) return;
+    setRetryActionPlaylistId(playlistId);
+    try {
+      await setPlaylistRetryCyclePaused(playlistId, paused);
+      showSuccess(paused ? "Retry cycle paused" : "Retry cycle resumed");
+      await fetchStatus();
+    } catch (err) {
+      showError(
+        err.response?.data?.message ||
+          err.message ||
+          "Failed to update retry cycle state",
+      );
+    } finally {
+      setRetryActionPlaylistId(null);
+    }
+  };
+
+  const handleConvertFlowToStatic = async (flow) => {
+    if (!flow || convertingId) return;
+    setConvertingId(flow.id);
+    try {
+      const reservedNames = new Set(
+        (status?.sharedPlaylists || [])
+          .map((playlist) => normalizeNameKey(playlist?.name))
+          .filter(Boolean),
+      );
+      const playlistName = reserveUniqueFlowName(
+        reservedNames,
+        `${flow.name} Static`,
+      );
+      const response = await convertFlowToStaticPlaylist(flow.id, {
+        name: playlistName,
+      });
+      showSuccess(
+        `Saved ${flow.name} as static playlist${response?.playlist?.name ? `: ${response.playlist.name}` : ""}`,
+      );
+      await fetchStatus();
+    } catch (err) {
+      showError(
+        err.response?.data?.message ||
+          err.response?.data?.error ||
+          err.message ||
+          "Failed to create static playlist",
+      );
+    } finally {
+      setConvertingId(null);
+    }
   };
 
   const handleSaveWorkerSettings = async () => {
@@ -948,13 +1420,15 @@ function FlowPage() {
       workerSettingsDraft.preferredFormat === "mp3" ? "mp3" : "flac";
     const safePreferredFormatStrict =
       workerSettingsDraft.preferredFormatStrict === true;
-    const safeSeedDownloads = workerSettingsDraft.seedDownloads !== false;
+    const safeRetryCycleMinutes = normalizeRetryCycleMinutes(
+      workerSettingsDraft.retryCycleMinutes,
+    );
     const current = workerSettingsBaseline;
     const hasChanges =
       safeConcurrency !== current.concurrency ||
       safePreferredFormat !== current.preferredFormat ||
       safePreferredFormatStrict !== current.preferredFormatStrict ||
-      safeSeedDownloads !== current.seedDownloads;
+      safeRetryCycleMinutes !== current.retryCycleMinutes;
     if (!hasChanges || savingWorkerSettings) return;
     setSavingWorkerSettings(true);
     try {
@@ -962,13 +1436,13 @@ function FlowPage() {
         concurrency: safeConcurrency,
         preferredFormat: safePreferredFormat,
         preferredFormatStrict: safePreferredFormatStrict,
-        seedDownloads: safeSeedDownloads,
+        retryCycleMinutes: safeRetryCycleMinutes,
       });
       setWorkerSettingsBaseline({
         concurrency: safeConcurrency,
         preferredFormat: safePreferredFormat,
         preferredFormatStrict: safePreferredFormatStrict,
-        seedDownloads: safeSeedDownloads,
+        retryCycleMinutes: safeRetryCycleMinutes,
       });
       showSuccess("Flow worker settings updated");
       setIsWorkerSettingsOpen(false);
@@ -994,6 +1468,7 @@ function FlowPage() {
     }
     return "Flow selection";
   };
+  const retryCyclePausedByPlaylist = status?.retryCyclePausedByPlaylist || {};
 
   const fetchFlowTracks = async (flowId, { showSpinner = true } = {}) => {
     if (!flowId) return;
@@ -1054,6 +1529,25 @@ function FlowPage() {
     });
   };
 
+  const handleToggleSharedPlaylistEditing = async (playlistId) => {
+    if (!playlistId) return;
+    const isClosing = editingId === playlistId;
+    setEditingId(isClosing ? null : playlistId);
+    if (isClosing) {
+      if (tracksExpandedId === playlistId) {
+        setTracksExpandedId(null);
+      }
+      return;
+    }
+    setSharedPlaylistErrors((prev) => {
+      const next = { ...prev };
+      delete next[playlistId];
+      return next;
+    });
+    setTracksExpandedId(null);
+    await fetchFlowTracks(playlistId);
+  };
+
   const handleNavigateArtist = (track) => {
     if (!track?.artistMbid) return;
     navigate(`/artist/${track.artistMbid}`, {
@@ -1074,53 +1568,38 @@ function FlowPage() {
       currentWorkerSettings.preferredFormat ||
     (workerSettingsDraft.preferredFormatStrict === true) !==
       currentWorkerSettings.preferredFormatStrict ||
-    (workerSettingsDraft.seedDownloads !== false) !==
-      currentWorkerSettings.seedDownloads;
+    normalizeRetryCycleMinutes(workerSettingsDraft.retryCycleMinutes) !==
+      currentWorkerSettings.retryCycleMinutes;
 
   return (
     <div className="flow-page max-w-6xl mx-auto px-4 pb-10">
+      <input
+        ref={importInputRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={handleImportFileChange}
+      />
       <div className="mb-4 flex items-center justify-between gap-3">
         <div className="flex items-end gap-2">
-          <h2 className="text-base font-semibold text-white">Playlists</h2>
+          <h2 className="text-base font-semibold text-white">Playlists / Flows</h2>
         </div>
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={handleOpenWorkerSettings}
-            className="btn btn-secondary btn-sm px-2 opacity-80 hover:opacity-100"
+            className="btn btn-secondary btn-sm p-2 opacity-80 hover:opacity-100"
             aria-label="Open flow worker settings"
           >
             <Settings className="w-4 h-4" />
           </button>
           <button
             type="button"
-            onClick={() => handleSetAllEnabled(true)}
-            className="btn btn-secondary btn-sm"
-            disabled={bulkActionRunning || disabledFlowCount === 0}
+            onClick={handleOpenImportPicker}
+            className="btn btn-secondary btn-sm gap-2"
           >
-            {bulkActionRunning ? (
-              <span className="inline-flex items-center gap-1.5">
-                <Loader2 className="w-3 h-3 animate-spin" />
-                Working...
-              </span>
-            ) : (
-              "Start All"
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={handleStopAllRequest}
-            className="btn btn-secondary btn-sm"
-            disabled={bulkActionRunning || enabledFlowCount === 0}
-          >
-            {bulkActionRunning ? (
-              <span className="inline-flex items-center gap-1.5">
-                <Loader2 className="w-3 h-3 animate-spin" />
-                Working...
-              </span>
-            ) : (
-              "Stop All"
-            )}
+            <Upload className="w-4 h-4" />
+            Import
           </button>
           <button
             type="button"
@@ -1128,12 +1607,53 @@ function FlowPage() {
             className="btn btn-primary btn-sm"
             disabled={creating}
           >
-            {creating ? "Creating..." : "New Playlist"}
+            {creating ? "Creating..." : "New Flow"}
           </button>
         </div>
       </div>
 
       <div className="space-y-4">
+        {sharedPlaylists.length > 0 && (
+          <div className="space-y-3">
+            {sharedPlaylists.map((playlist) => (
+              <SharedPlaylistCard
+                key={playlist.id}
+                playlist={playlist}
+                stats={getPlaylistStats(playlist.id)}
+                currentJob={status?.worker?.currentJob}
+                isEditing={editingId === playlist.id}
+                isTracksOpen={tracksExpandedId === playlist.id}
+                tracks={tracksByFlowId[playlist.id] || []}
+                tracksLoading={tracksLoadingByFlowId[playlist.id] === true}
+                tracksError={tracksErrorByFlowId[playlist.id] || ""}
+                nameDraft={sharedPlaylistDrafts[playlist.id] ?? playlist.name ?? ""}
+                nameError={sharedPlaylistErrors[playlist.id] || ""}
+                isApplying={applyingSharedPlaylistId === playlist.id}
+                deletingTrackId={deletingSharedTrackId}
+                deletingId={deletingId}
+                onToggleEditing={() => handleToggleSharedPlaylistEditing(playlist.id)}
+                onNameChange={(name) =>
+                  setSharedPlaylistDrafts((prev) => ({
+                    ...prev,
+                    [playlist.id]: name,
+                  }))
+                }
+                onCancelEdit={() => handleCancelSharedPlaylistEdit(playlist)}
+                onApplyEdit={() => handleApplySharedPlaylist(playlist)}
+                onDelete={() => handleDeleteSharedPlaylist(playlist)}
+                onViewTracks={() => handleToggleTracks(playlist.id)}
+                onDeleteTrack={(track) => handleDeleteSharedPlaylistTrack(playlist, track)}
+                onNavigateArtist={handleNavigateArtist}
+                retryCyclePaused={retryCyclePausedByPlaylist[playlist.id] === true}
+                retryActionInFlight={retryActionPlaylistId === playlist.id}
+                onSetRetryCyclePaused={(paused) =>
+                  handleSetRetryCyclePaused(playlist.id, paused)
+                }
+              />
+            ))}
+          </div>
+        )}
+
         {effectiveFlowList.length === 0 && (
           <FlowEmptyState onCreate={handleCreateInline} creating={creating} />
         )}
@@ -1158,6 +1678,8 @@ function FlowPage() {
           const simpleMixSize = Number.isFinite(simpleSize) ? simpleSize : 0;
           const isApplying = applyingFlowId === flow.id;
           const hasChanges = isFlowDirty(flow, simpleDraft);
+          const canExport = Number(stats?.total || 0) > 0;
+          const canConvertToStatic = Number(stats?.done || 0) > 0;
           return (
             <FlowCard
               key={flow.id}
@@ -1179,8 +1701,13 @@ function FlowPage() {
               simpleError={simpleError}
               isApplying={isApplying}
               hasChanges={hasChanges}
+              canExport={canExport}
+              canConvertToStatic={canConvertToStatic}
+              convertingId={convertingId}
               togglingId={togglingId}
               deletingId={deletingId}
+              onExport={() => handleExportFlow(flow)}
+              onConvertToStatic={() => handleConvertFlowToStatic(flow)}
               onToggleEditing={() => handleToggleEditing(flow.id)}
               onToggleEnabled={(checked) => handleToggleRequest(flow, checked)}
               onDelete={() => handleDelete(flow)}
@@ -1223,12 +1750,6 @@ function FlowPage() {
         onCancel={() => setConfirmDisable(null)}
         onConfirm={handleConfirmDisable}
       />
-      <ConfirmStopAllModal
-        confirmStopAll={confirmStopAll}
-        bulkActionRunning={bulkActionRunning}
-        onCancel={() => setConfirmStopAll(false)}
-        onConfirm={handleConfirmStopAll}
-      />
       <FlowWorkerSettingsModal
         isOpen={isWorkerSettingsOpen}
         settings={workerSettingsDraft}
@@ -1240,6 +1761,27 @@ function FlowPage() {
         }}
         onChange={setWorkerSettingsDraft}
         onSave={handleSaveWorkerSettings}
+      />
+      <FlowImportReviewModal
+        importReview={importReview}
+        importing={importing}
+        onNameChange={(index, name) => {
+          setImportReview((prev) => {
+            if (!prev || !Array.isArray(prev.flows)) return prev;
+            const nextFlows = prev.flows.map((flow, flowIndex) =>
+              flowIndex === index ? { ...flow, importName: name } : flow,
+            );
+            return {
+              ...prev,
+              flows: nextFlows,
+            };
+          });
+        }}
+        onCancel={() => {
+          if (importing) return;
+          setImportReview(null);
+        }}
+        onConfirm={handleConfirmImport}
       />
     </div>
   );

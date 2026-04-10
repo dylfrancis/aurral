@@ -6,6 +6,8 @@ import {
   Pencil,
   FilePlus2,
   ListMusic,
+  Download,
+  Upload,
   Play,
   Pause,
   Shuffle,
@@ -14,6 +16,8 @@ import {
   ExternalLink,
   Volume2,
   VolumeX,
+  ChevronDown,
+  MoreHorizontal,
 } from "lucide-react";
 import PillToggle from "../components/PillToggle";
 import FlipSaveButton from "../components/FlipSaveButton";
@@ -60,6 +64,23 @@ const FLOW_WORKER_FORMAT_OPTIONS = [
   { id: "flac", label: "FLAC" },
   { id: "mp3", label: "MP3" },
 ];
+const FLOW_WORKER_RETRY_CYCLE_OPTIONS = [
+  { minutes: 15, label: "15 min" },
+  { minutes: 30, label: "30 min" },
+  { minutes: 60, label: "1 hour" },
+  { minutes: 360, label: "6 hours" },
+  { minutes: 720, label: "12 hours" },
+  { minutes: 1440, label: "1 day" },
+];
+const SCHEDULE_HOUR_OPTIONS = Array.from({ length: 24 }, (_, hour) => {
+  const normalized = `${String(hour).padStart(2, "0")}:00`;
+  const suffix = hour >= 12 ? "PM" : "AM";
+  const hour12 = hour % 12 || 12;
+  return {
+    value: normalized,
+    label: `${hour12}:00 ${suffix}`,
+  };
+});
 
 export function MixSlider({ mix, onChange, normalizeMixPercent }) {
   const normalized = normalizeMixPercent(mix);
@@ -271,6 +292,10 @@ export function FlowFormFields({
         (a, b) => a - b
       )
     : [];
+  const scheduleTime = String(draft?.scheduleTime || "00:00");
+  const scheduleTimeLabel =
+    SCHEDULE_HOUR_OPTIONS.find((option) => option.value === scheduleTime)?.label ||
+    scheduleTime;
   const schedulePhrase =
     scheduleDays.length === 7
       ? "Update daily"
@@ -283,8 +308,10 @@ export function FlowFormFields({
           : scheduleDays.length >= 3 && scheduleDays.length <= 6
             ? `Update ${SCHEDULE_COUNT_LABELS[scheduleDays.length]} a week`
             : "Update weekly";
+  const scheduleTimePhrase = `at ${scheduleTimeLabel}`;
   const clauses = [
     schedulePhrase,
+    scheduleTimePhrase,
     mixPhrase,
     tagPhrase,
     relatedPhrase,
@@ -321,22 +348,8 @@ export function FlowFormFields({
   return (
     <div className="grid gap-6">
       <div className="grid gap-4 rounded-lg border border-white/10 bg-white/5 p-4">
-        <div className="flex gap-4">
-          <div className="flex-1 grid gap-1.5">
-            <label className="text-xs uppercase tracking-wider text-[#8b8b90] font-medium">
-              Playlist Name
-            </label>
-            <input
-              type="text"
-              className={inputClassName}
-              value={draft.name}
-              onChange={(event) => {
-                const value = event.target.value;
-                updateDraft((prev) => ({ ...prev, name: value }));
-              }}
-            />
-          </div>
-          <div className="w-24 grid gap-1.5">
+        <div className="flex flex-wrap items-start gap-6">
+          <div className="grid gap-1.5 w-24 shrink-0">
             <label className="text-xs uppercase tracking-wider text-[#8b8b90] font-medium">
               Tracks
             </label>
@@ -352,55 +365,76 @@ export function FlowFormFields({
               }}
             />
           </div>
-        </div>
-        <div className="grid gap-1.5">
-          <label className="text-xs uppercase tracking-wider text-[#8b8b90] font-medium">
-            Update Days
-          </label>
-          <div className="flex flex-wrap items-center gap-2">
-            {WEEKDAY_OPTIONS.map((day) => {
-              const checked = scheduleDays.includes(day.id);
-              return (
-                <label
-                  key={day.id}
-                  className={`inline-flex items-center rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${
-                    checked
-                      ? "bg-[#718062] text-[#f4f1eb]"
-                      : "bg-[#15161a] text-[#a7aab5] hover:bg-[#202229] hover:text-[#dde1ea]"
-                  }`}
-                  title={day.full}
-                >
-                  <input
-                    type="checkbox"
-                    className="sr-only"
-                    checked={checked}
-                    disabled={checked && scheduleDays.length === 1}
-                    onChange={() =>
-                      updateDraft((prev) => {
-                        const current = Array.isArray(prev?.scheduleDays)
-                          ? prev.scheduleDays
-                          : [];
-                        const normalized = [...new Set(current
-                          .map((entry) => Number(entry))
-                          .filter((entry) => Number.isFinite(entry) && entry >= 0 && entry <= 6))];
-                        if (checked && normalized.length === 1) {
-                          return prev;
-                        }
-                        const next = checked
-                          ? normalized.filter((entry) => entry !== day.id)
-                          : [...normalized, day.id];
-                        return {
-                          ...prev,
-                          scheduleDays: next.sort((a, b) => a - b),
-                        };
-                      })
-                    }
-                  />
-                  <span>{day.short}</span>
-                </label>
-              );
-            })}
+          <div className="grid gap-1.5 shrink-0">
+            <label className="text-xs uppercase tracking-wider text-[#8b8b90] font-medium">
+              Update Days
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              {WEEKDAY_OPTIONS.map((day) => {
+                const checked = scheduleDays.includes(day.id);
+                return (
+                  <label
+                    key={day.id}
+                    className={`inline-flex items-center justify-center rounded w-10 h-10 text-xs font-semibold transition-colors cursor-pointer ${
+                      checked
+                        ? "bg-[#718062] text-[#f4f1eb]"
+                        : "bg-[#15161a] text-[#a7aab5] hover:bg-[#202229] hover:text-[#dde1ea]"
+                    }`}
+                    title={day.full}
+                  >
+                    <input
+                      type="checkbox"
+                      className="sr-only"
+                      checked={checked}
+                      disabled={checked && scheduleDays.length === 1}
+                      onChange={() =>
+                        updateDraft((prev) => {
+                          const current = Array.isArray(prev?.scheduleDays)
+                            ? prev.scheduleDays
+                            : [];
+                          const normalized = [...new Set(current
+                            .map((entry) => Number(entry))
+                            .filter((entry) => Number.isFinite(entry) && entry >= 0 && entry <= 6))];
+                          if (checked && normalized.length === 1) {
+                            return prev;
+                          }
+                          const next = checked
+                            ? normalized.filter((entry) => entry !== day.id)
+                            : [...normalized, day.id];
+                          return {
+                            ...prev,
+                            scheduleDays: next.sort((a, b) => a - b),
+                          };
+                        })
+                      }
+                    />
+                    <span>{day.short}</span>
+                  </label>
+                );
+              })}
+            </div>
           </div>
+          <div className="grid gap-1.5 w-36 shrink-0">
+              <label className="text-xs uppercase tracking-wider text-[#8b8b90] font-medium">
+              Update Hour
+              </label>
+              <select
+                className={inputClassName}
+                value={scheduleTime}
+                onChange={(event) =>
+                  updateDraft((prev) => ({
+                    ...prev,
+                    scheduleTime: event.target.value || "00:00",
+                  }))
+                }
+              >
+                {SCHEDULE_HOUR_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
         </div>
       </div>
 
@@ -711,6 +745,43 @@ export function FlowStatusCards({
   );
 }
 
+export function MoreMenu({ children }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (menuRef.current && !menuRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    };
+    if (isOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [isOpen]);
+
+  return (
+    <div className={`relative ${isOpen ? "z-[300]" : "z-30"}`} ref={menuRef}>
+      <button 
+        type="button" 
+        onClick={(e) => { e.stopPropagation(); setIsOpen(!isOpen); }} 
+        className={`btn btn-sm gap-2 ${isOpen ? "btn-primary" : "btn-secondary"}`}
+        aria-label="More options"
+      >
+        <MoreHorizontal className="w-4 h-4" />
+        <span className="hidden sm:inline">More</span>
+      </button>
+      {isOpen && (
+        <div className="absolute right-0 top-full mt-2 w-48 rounded-md border border-[#3a3a44] bg-[#2d2d36] py-1 z-[320] flex flex-col"
+             onClick={() => setIsOpen(false)}>
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function FlowCard({
   flow,
   enabled,
@@ -730,8 +801,13 @@ export function FlowCard({
   simpleError,
   isApplying,
   hasChanges,
+  canExport,
+  canConvertToStatic,
+  convertingId,
   togglingId,
   deletingId,
+  onExport,
+  onConvertToStatic,
   onToggleEditing,
   onToggleEnabled,
   onDelete,
@@ -816,24 +892,26 @@ export function FlowCard({
   }
   const metaItems = [];
   if (enabled && nextRun && state !== "running" && !isGeneratingThisFlow) {
-    metaItems.push(`Next update in ${nextRun}`);
+    metaItems.push(
+      nextRun === "soon" ? "Next update soon" : `Next update in ${nextRun}`,
+    );
   }
+  const typeLabel = enabled ? "Flow" : "Flow Draft";
+  const statusSummary = enabled
+    ? "Flow refreshed weekly"
+    : "Flow ready when enabled";
 
   return (
-    <div className="bg-card rounded-lg border border-white/5 overflow-hidden">
-      <div
-        className={`p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 transition-opacity ${
-          enabled ? "opacity-100" : "opacity-50"
-        }`}
-      >
-        <div className="min-w-0 flex-1 grid gap-2.5">
-          <div className="flex items-center gap-3">
-            <span className="inline-flex h-5 min-w-[1.5rem] items-center justify-center rounded-full border border-white/10 bg-white/5 px-1.5 text-[11px] font-medium text-[#b5b5bc]">
-              {flow.size}
+    <div className="bg-card rounded-lg border border-white/5 overflow-visible">
+      <div className="p-4 flex flex-col md:flex-row md:items-start justify-between gap-4">
+        <div className={`min-w-0 flex-1 grid gap-2.5 ${enabled ? "" : "opacity-50"}`}>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="rounded-full bg-black/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.18em] text-[#d2dac9]">
+              {typeLabel}
             </span>
-            <h3 className="text-base font-medium text-white truncate">
-              {flow.name}
-            </h3>
+            <span className="rounded-full bg-white/5 px-2 py-0.5 text-[11px] text-[#c6c6cb]">
+              {flow.size} tracks
+            </span>
             {state === "running" && (
               <span className="badge badge-success badge-sm gap-1.5 pl-1.5 pr-2">
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -847,11 +925,36 @@ export function FlowCard({
               </span>
             )}
           </div>
-          {metaItems.length > 0 ? (
+          <div className="space-y-1">
+            {isEditing ? (
+              <input
+                type="text"
+                className="input input-sm h-9 w-full max-w-md bg-[#1c1b22] text-base font-medium text-white"
+                value={simpleDraft?.name ?? ""}
+                onChange={(event) =>
+                  onDraftChange((prev) => ({
+                    ...prev,
+                    name: event.target.value,
+                  }))
+                }
+                onInput={onClearError}
+                aria-label={`Edit ${flow.name} name`}
+              />
+            ) : (
+              <h3 className="text-base font-medium text-white truncate">
+                {flow.name}
+              </h3>
+            )}
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#b5b5bc]">
-              <span>{metaItems.join(" • ")}</span>
+              <span>{statusSummary}</span>
+              {metaItems.length > 0 ? (
+                <>
+                  <span className="text-white/25">•</span>
+                  <span>{metaItems.join(" • ")}</span>
+                </>
+              ) : null}
             </div>
-          ) : null}
+          </div>
           {flowWorkerMessage ? (
             <div className="truncate text-xs text-[#9aa886]">
               {flowWorkerMessage}
@@ -869,44 +972,72 @@ export function FlowCard({
               </div>
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#d3d3d8]">
                 <span>{progressPct}% complete</span>
-                <span className="text-[#b5b5bc]">{processedDisplay}/{total} processed</span>
+                <span className="text-white/25">•</span>
+                <span>Pending {pendingCount}</span>
+                <span className="text-white/25">•</span>
+                <span>Downloading {downloadingCount}</span>
+                <span className="text-white/25">•</span>
+                <span>Done {processedDisplay}</span>
               </div>
             </div>
           ) : null}
         </div>
 
-        <div className="flex items-center gap-3 shrink-0">
-          <div className="flex items-center gap-1 rounded-md border border-white/10 bg-white/5 p-1">
-            {isEditing && (
-              <button
-                onClick={onDelete}
-                className="btn btn-sm btn-ghost px-2 text-red-500 hover:text-red-600 hover:bg-red-500/10"
-                aria-label="Delete flow"
-                disabled={deletingId === flow.id}
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            )}
+        <div className="flex flex-wrap items-center justify-end gap-3 shrink-0">
+          <div className="flex items-center gap-1.5">
             <button
               onClick={onViewTracks}
-              className={`btn ${isTracksOpen ? "btn-primary" : "btn-secondary"} btn-sm px-2`}
+              className={`btn ${isTracksOpen ? "btn-primary" : "btn-secondary"} btn-sm gap-2`}
               aria-label={isTracksOpen ? `Close ${flow.name} tracks` : `View ${flow.name} tracks`}
+              title={isTracksOpen ? `Close ${flow.name} tracks` : `View ${flow.name} tracks`}
               aria-pressed={isTracksOpen}
               disabled={!enabled && !isTracksOpen}
             >
               <ListMusic className="w-4 h-4" />
+              <span className="hidden sm:inline">Tracks</span>
             </button>
             <button
               onClick={onToggleEditing}
-              className={`btn ${isEditing ? "btn-primary" : "btn-secondary"} btn-sm px-2`}
+              className={`btn ${isEditing ? "btn-primary" : "btn-secondary"} btn-sm gap-2`}
               aria-label={isEditing ? "Close editor" : "Edit flow"}
+              title={isEditing ? `Close ${flow.name} editor` : `Edit ${flow.name}`}
               aria-pressed={isEditing}
             >
               <Pencil className="w-4 h-4" />
+              <span className="hidden sm:inline">Manage</span>
             </button>
+            <MoreMenu>
+              <button
+                onClick={onConvertToStatic}
+                className="w-full text-left px-3 py-2.5 text-sm text-[#d6d6d8] hover:bg-white/10 hover:text-white flex items-center gap-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!canConvertToStatic || convertingId === flow.id}
+              >
+                {convertingId === flow.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <FilePlus2 className="w-4 h-4" />}
+                Convert to Static
+              </button>
+              <button
+                onClick={onExport}
+                className="w-full text-left px-3 py-2.5 text-sm text-[#d6d6d8] hover:bg-white/10 hover:text-white flex items-center gap-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!canExport}
+              >
+                <Download className="w-4 h-4" />
+                Download JSON
+              </button>
+              <div className="my-1 border-t border-white/10" />
+              <button
+                onClick={onDelete}
+                className="w-full text-left px-3 py-2.5 text-sm text-red-400 hover:bg-red-500/10 hover:text-red-300 flex items-center gap-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={deletingId === flow.id}
+              >
+                {deletingId === flow.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                Delete Flow
+              </button>
+            </MoreMenu>
           </div>
           
-          <div className="flex items-center gap-1.5 rounded-md border border-white/10 bg-black/20 px-2 py-1.5">
+          <div className="hidden sm:block w-px h-6 bg-white/10" />
+          
+          <div className="flex items-center gap-1.5 rounded-md bg-black/20 px-2 py-1.5">
             {togglingId === flow.id && (
               <Loader2 className="w-3.5 h-3.5 animate-spin text-white/50" />
             )}
@@ -970,6 +1101,10 @@ export function FlowTracksPanel({
   tracks,
   loading,
   error,
+  emptyMessage = "No tracks generated for this flow yet.",
+  editable = false,
+  deletingTrackId = null,
+  onDeleteTrack,
   onNavigateArtist,
 }) {
   const [queue, setQueue] = useState([]);
@@ -1277,7 +1412,7 @@ export function FlowTracksPanel({
         )}
         {!loading && !error && tracks.length === 0 && (
           <div className="p-6 text-[#c1c1c3] text-sm">
-            No tracks generated for this flow yet.
+            {emptyMessage}
           </div>
         )}
         {!loading && !error && tracks.length > 0 && (
@@ -1293,6 +1428,7 @@ export function FlowTracksPanel({
             <tbody>
               {tracks.map((track, index) => {
                 const canPlay = track.status === "done" && !!track.streamUrl;
+                const canDelete = editable && track.status === "done" && !!track.id;
                 const isCurrent = track.id === currentTrackId;
                 const progressWidth = `${Math.round(playbackProgress * 100)}%`;
                 return (
@@ -1338,6 +1474,21 @@ export function FlowTracksPanel({
                         >
                           <ExternalLink className="w-3.5 h-3.5" />
                         </button>
+                        {canDelete ? (
+                          <button
+                            onClick={() => onDeleteTrack?.(track)}
+                            className="btn btn-ghost btn-xs px-2 text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                            aria-label={`Remove ${track.trackName} from playlist`}
+                            title={`Remove ${track.trackName} from playlist`}
+                            disabled={deletingTrackId === track.id}
+                          >
+                            {deletingTrackId === track.id ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                        ) : null}
                       </div>
                     </td>
                   </tr>
@@ -1370,8 +1521,348 @@ export function FlowEmptyState({ onCreate, creating }) {
   );
 }
 
+export function SharedPlaylistCard({
+  playlist,
+  stats,
+  currentJob,
+  isEditing,
+  isTracksOpen,
+  tracks,
+  tracksLoading,
+  tracksError,
+  nameDraft,
+  nameError,
+  isApplying,
+  deletingTrackId,
+  deletingId,
+  onToggleEditing,
+  onNameChange,
+  onCancelEdit,
+  onApplyEdit,
+  onDelete,
+  onDeleteTrack,
+  onViewTracks,
+  onNavigateArtist,
+  retryCyclePaused,
+  retryActionInFlight,
+  onSetRetryCyclePaused,
+}) {
+  const pending = Number(stats?.pending || 0);
+  const downloading = Number(stats?.downloading || 0);
+  const done = Number(stats?.done || 0);
+  const failed = Number(stats?.failed || 0);
+  const total = Math.max(Number(playlist?.trackCount || 0), pending + downloading + done);
+  const progressPct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const waitingForRetryCycle =
+    pending === 0 &&
+    downloading === 0 &&
+    failed > 0 &&
+    done < Number(playlist?.trackCount || 0);
+  const isCurrentJob =
+    currentJob?.playlistType === playlist.id &&
+    currentJob?.artistName &&
+    currentJob?.trackName;
+
+  return (
+    <div className="overflow-visible rounded-lg border border-white/5 bg-card">
+      <div className="flex flex-col gap-4 px-4 py-4 md:flex-row md:items-start md:justify-between">
+        <div className="min-w-0 flex-1 space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="rounded-full bg-black/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.18em] text-[#d6e5c8]">
+              Playlist
+            </span>
+            <span className="rounded-full bg-white/5 px-2 py-0.5 text-[11px] text-[#c6c6cb]">
+              {playlist.trackCount} tracks
+            </span>
+          </div>
+          <div className="space-y-1">
+            {isEditing ? (
+              <input
+                type="text"
+                className="input input-sm h-9 w-full max-w-md bg-[#1c1b22] text-base font-medium text-white"
+                value={nameDraft ?? ""}
+                onChange={(event) => onNameChange(event.target.value)}
+                aria-label={`Edit ${playlist.name} name`}
+              />
+            ) : (
+              <h3 className="truncate text-base font-medium text-white">
+                {playlist.name}
+              </h3>
+            )}
+            {isCurrentJob ? (
+              <p className="truncate text-xs text-[#9ed3a1]">
+                Downloading {currentJob.trackName}
+              </p>
+            ) : null}
+            {waitingForRetryCycle ? (
+              <p className="text-xs text-[#d8c78e]">
+                Waiting for next retry cycle
+              </p>
+            ) : null}
+          </div>
+          <div className="grid gap-1.5">
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full rounded-full bg-[#707e61] transition-all duration-300"
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#c7ccc7]">
+              <span>{progressPct}% complete</span>
+              <span className="text-white/25">•</span>
+              <span>Pending {pending}</span>
+              <span className="text-white/25">•</span>
+              <span>Downloading {downloading}</span>
+              <span className="text-white/25">•</span>
+              <span>Done {done}</span>
+              <span className="text-white/25">•</span>
+              <span>Stalled {failed}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-end gap-3 shrink-0">
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={onViewTracks}
+              className={`btn ${isTracksOpen ? "btn-primary" : "btn-secondary"} btn-sm gap-2`}
+              aria-label={isTracksOpen ? `Close ${playlist.name} tracks` : `View ${playlist.name} tracks`}
+              title={isTracksOpen ? `Close ${playlist.name} tracks` : `View ${playlist.name} tracks`}
+              aria-pressed={isTracksOpen}
+            >
+              <ListMusic className="w-4 h-4" />
+              <span className="hidden sm:inline">Tracks</span>
+            </button>
+            <button
+              type="button"
+              onClick={onToggleEditing}
+              className={`btn ${isEditing ? "btn-primary" : "btn-secondary"} btn-sm gap-2`}
+              aria-label={isEditing ? `Close ${playlist.name} editor` : `Edit ${playlist.name}`}
+              title={isEditing ? `Close ${playlist.name} editor` : `Edit ${playlist.name}`}
+              aria-pressed={isEditing}
+            >
+              <Pencil className="w-4 h-4" />
+              <span className="hidden sm:inline">Manage</span>
+            </button>
+            <MoreMenu>
+              <button
+                type="button"
+                onClick={() => onSetRetryCyclePaused?.(!retryCyclePaused)}
+                className="w-full text-left px-3 py-2.5 text-sm text-[#d6d6d8] hover:bg-white/10 hover:text-white flex items-center gap-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={retryActionInFlight}
+              >
+                {retryActionInFlight ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : retryCyclePaused ? (
+                  <Play className="w-4 h-4" />
+                ) : (
+                  <Pause className="w-4 h-4" />
+                )}
+                {retryCyclePaused ? "Resume Retry Cycle" : "Pause Retry Cycle"}
+              </button>
+              <div className="my-1 border-t border-white/10" />
+              <button
+                type="button"
+                onClick={onDelete}
+                className="w-full text-left px-3 py-2.5 text-sm text-red-400 hover:bg-red-500/10 hover:text-red-300 flex items-center gap-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={deletingId === playlist.id}
+              >
+                {deletingId === playlist.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                Delete Playlist
+              </button>
+            </MoreMenu>
+          </div>
+        </div>
+      </div>
+
+      {isEditing && (
+        <div className="px-4 pb-4">
+          <div className="card-separator mb-4" />
+          <div className="grid gap-4 rounded-lg border border-white/10 bg-white/5 p-4">
+            <FlowTracksPanel
+              tracks={tracks}
+              loading={tracksLoading}
+              error={tracksError}
+              emptyMessage="No downloaded tracks in this static playlist yet."
+              editable={true}
+              deletingTrackId={deletingTrackId}
+              onDeleteTrack={onDeleteTrack}
+              onNavigateArtist={onNavigateArtist}
+            />
+            {nameError ? (
+              <div className="text-xs text-red-400 font-medium">{nameError}</div>
+            ) : null}
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <button onClick={onCancelEdit} className="btn btn-secondary btn-sm">
+                Cancel
+              </button>
+              <FlipSaveButton
+                disabled={String(nameDraft || "").trim() === String(playlist.name || "").trim()}
+                saving={isApplying}
+                onClick={onApplyEdit}
+                label="Save"
+                savedLabel="Saved"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isTracksOpen && !isEditing && (
+        <div className="px-4 pb-4">
+          <div className="card-separator mb-4" />
+          <FlowTracksPanel
+            tracks={tracks}
+            loading={tracksLoading}
+            error={tracksError}
+            emptyMessage="No downloaded tracks in this static playlist yet."
+            editable={false}
+            deletingTrackId={deletingTrackId}
+            onDeleteTrack={onDeleteTrack}
+            onNavigateArtist={onNavigateArtist}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function FlowImportReviewModal({
+  importReview,
+  importing,
+  onNameChange,
+  onCancel,
+  onConfirm,
+}) {
+  if (!importReview) return null;
+
+  const flows = Array.isArray(importReview.flows) ? importReview.flows : [];
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      style={{ backgroundColor: "rgba(0, 0, 0, 0.78)" }}
+      onClick={importing ? undefined : onCancel}
+    >
+      <div
+        className="mx-4 w-full max-w-3xl overflow-hidden rounded-lg border border-white/5 bg-card shadow-[0_24px_80px_rgba(0,0,0,0.45)]"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="border-b border-white/10 px-5 py-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="space-y-1">
+              <div className="text-xs font-medium uppercase tracking-[0.2em] text-[#dbe6cf]">
+                Import Playlist
+              </div>
+              <h3 className="text-lg font-semibold text-white">
+                {importReview.fileName || "Selected playlist file"}
+              </h3>
+              <p className="text-sm text-[#bcc4b4]">
+                {flows.length} {flows.length === 1 ? "playlist" : "playlists"} detected. Imports stay separate from weekly flows and queue their own downloads.
+              </p>
+            </div>
+            <div className="rounded-full bg-black/25 px-3 py-1 text-sm text-[#dbe6cf]">
+              JSON import
+            </div>
+          </div>
+        </div>
+
+        <div className="max-h-[60vh] overflow-auto px-5 py-4">
+          <div className="grid gap-3">
+            {flows.map((flow, index) => {
+              const trackCount = Number(flow?.tracks?.length || flow?.trackCount || 0);
+              const previewTracks = Array.isArray(flow?.tracks) ? flow.tracks.slice(0, 3) : [];
+              return (
+                <div
+                  key={`${flow?.name || "flow"}-${index}`}
+                  className="rounded-lg border border-white/5 bg-black/20 px-4 py-3"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h4 className="text-sm font-medium text-white">
+                      {flow?.name || `Playlist ${index + 1}`}
+                    </h4>
+                    <span className="rounded-full bg-white/5 px-2 py-0.5 text-[11px] text-[#c6c6cb]">
+                      {trackCount} tracks
+                    </span>
+                    {flow?.sourceName ? (
+                      <span className="rounded-full bg-black/25 px-2 py-0.5 text-[11px] text-[#dce8d0]">
+                        From {flow.sourceName}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="mt-3">
+                    <label className="mb-1 block text-[11px] uppercase tracking-[0.16em] text-[#90988b]">
+                      Playlist Name
+                    </label>
+                    <input
+                      type="text"
+                      value={flow?.importName ?? flow?.name ?? ""}
+                      onChange={(event) => onNameChange?.(index, event.target.value)}
+                      placeholder={`Playlist ${index + 1}`}
+                      disabled={importing}
+                      className="w-full rounded-md border border-white/10 bg-black/35 px-3 py-2 text-sm text-white outline-none transition focus:border-[#90a07d] focus:ring-1 focus:ring-[#90a07d]"
+                    />
+                  </div>
+                  <div className="mt-2 grid gap-1 text-xs text-[#aeb0b6]">
+                    {previewTracks.map((track) => (
+                      <span key={`${track.artistName}-${track.trackName}`}>
+                        {track.artistName} — {track.trackName}
+                      </span>
+                    ))}
+                    {trackCount > previewTracks.length ? (
+                      <span className="text-[#89938a]">
+                        +{trackCount - previewTracks.length} more tracks
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 px-5 py-4">
+          <p className="max-w-xl text-xs leading-5 text-[#9ca09f]">
+            Supports exported playlist files, a single playlist object, or a raw array of tracks. Imported playlists stay separate from weekly flow refreshes.
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onCancel}
+              className="btn btn-secondary"
+              disabled={importing}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={onConfirm}
+              className="btn btn-primary gap-2"
+              disabled={importing || flows.length === 0}
+            >
+              {importing ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Importing...
+                </>
+              ) : (
+                <>
+                  <Upload className="w-4 h-4" />
+                  Import Playlists
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function ConfirmDeleteModal({ confirmDelete, deletingId, onCancel, onConfirm }) {
   if (!confirmDelete) return null;
+  const isShared = confirmDelete.kind === "shared";
 
   return (
     <div
@@ -1384,7 +1875,9 @@ export function ConfirmDeleteModal({ confirmDelete, deletingId, onCancel, onConf
           Delete {confirmDelete.title}?
         </h3>
         <p className="text-[#c1c1c3] mb-6">
-          This removes the flow and its playlist setup. You can recreate it later.
+          {isShared
+            ? "This removes the imported static playlist and any downloaded files tied to it."
+            : "This removes the flow and its playlist setup. You can recreate it later."}
         </p>
         <div className="flex gap-3 justify-end">
           <button onClick={onCancel} className="btn btn-secondary">
@@ -1747,23 +2240,33 @@ export function FlowWorkerSettingsModal({
               </div>
             </div>
           </div>
-          <div className="flex items-center justify-between rounded-md border border-white/10 bg-black/20 px-3 py-3">
-            <div className="grid gap-0.5 pr-3">
-              <span className="text-sm font-medium text-white">Seed Downloads Folder</span>
-              <span className="text-xs text-[#8b8b90]">
-                Share the flow downloads folder on Soulseek unless you turn this off.
-              </span>
+          <div className="grid gap-1.5">
+            <label className="text-xs uppercase tracking-wider text-[#8b8b90] font-medium">
+              Retry Cycle
+            </label>
+            <div className="relative">
+              <select
+                value={settings.retryCycleMinutes}
+                onChange={(event) =>
+                  onChange((prev) => ({
+                    ...prev,
+                    retryCycleMinutes: Number(event.target.value),
+                  }))
+                }
+                className="h-[52px] w-full appearance-none rounded-md border border-white/10 bg-black/20 pl-3 pr-12 text-sm text-white outline-none transition focus:border-[#90a07d] focus:ring-1 focus:ring-[#90a07d]"
+              >
+                {FLOW_WORKER_RETRY_CYCLE_OPTIONS.map((option) => (
+                  <option
+                    key={option.minutes}
+                    value={option.minutes}
+                    className="bg-[#131419] text-white"
+                  >
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-5 w-5 -translate-y-1/2 text-white" />
             </div>
-            <PillToggle
-              checked={settings.seedDownloads !== false}
-              onChange={(event) => {
-                const checked = event.target.checked;
-                onChange((prev) => ({
-                  ...prev,
-                  seedDownloads: checked,
-                }));
-              }}
-            />
           </div>
         </div>
         <div className="flex gap-3 justify-end">
